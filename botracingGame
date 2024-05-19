@@ -1,0 +1,330 @@
+-- Bot Racing Game
+
+-- GLOBAL VARIABLES
+
+-- Game progression modes in a loop:
+-- [Not-Started] -> Waiting -> Playing -> [Someone wins or timeout] -> Waiting...
+GameMode = GameMode or "Not-Started"
+StateChangeTime = StateChangeTime or undefined
+
+-- State durations (in milliseconds)
+WaitTime = WaitTime or 2 * 60 * 1000 -- 2 minutes
+BotTimer = BotTimer or 30 * 1000 -- 30 seconds
+WarningTime = WarningTime or 5 * 1000 -- 5 seconds
+Now = Now or undefined -- Current time, updated on every message.
+
+-- Token information for player stakes.
+PaymentToken = PaymentToken or "CRED"  -- Token address
+
+-- Players waiting to join the next game and their payment status.
+Waiting = Waiting or {}
+-- Active players and their bot states.
+Players = Players or {}
+-- Bot timers and CRED counts.
+BotTimers = BotTimers or {}
+
+-- Default player state initialization.
+function PlayerInitState()
+    return {
+        CredsUsed = 0,
+        TotalTime = 0
+    }
+end
+
+-- Sends a state change announcement to all registered listeners.
+-- @param event: The event type or name.
+-- @param description: Description of the event.
+function announce(event, description)
+    for ix, address in pairs(Listeners) do
+        ao.send({
+            Target = address,
+            Action = "Announcement",
+            Event = event,
+            Data = description
+        })
+    end
+    return print("Announcement: " .. event .. " " .. description)
+end
+
+-- Sends a reward to a player.
+-- @param recipient: The player receiving the reward.
+-- @param qty: The quantity of the reward.
+-- @param reason: The reason for the reward.
+function sendReward(recipient, qty, reason)
+    if type(qty) ~= number then
+      qty = tonumber(qty)
+    end
+    ao.send({
+        Target = PaymentToken,
+        Action = "Transfer",
+        Quantity = tostring(qty),
+        Recipient = recipient,
+        Reason = reason
+    })
+    return print("Sent Reward: " .. tostring(qty) .. " tokens to " .. recipient .. " " .. reason)
+end
+
+-- Starts the waiting period for players to become ready to play.
+function startWaitingPeriod()
+    GameMode = "Waiting"
+    StateChangeTime = Now + WaitTime
+    announce("Started-Waiting-Period", "The game is about to begin! Send your token to take part.")
+    print('Starting Waiting Period')
+end
+
+-- Starts the game if there are enough players.
+function startGamePeriod()
+    local paidPlayers = 0
+    for player, hasPaid in pairs(Waiting) do
+        if hasPaid then
+            paidPlayers = paidPlayers + 1
+        end
+    end
+
+    if paidPlayers < 2 then
+        announce("Not-Enough-Players", "Not enough players registered! Restarting...")
+        for player, hasPaid in pairs(Waiting) do
+            if hasPaid then
+                Waiting[player] = false
+                sendReward(player, 1, "Refund")
+            end
+        end
+        startWaitingPeriod()
+        return
+    end
+
+    LastTick = undefined
+    GameMode = "Playing"
+    StateChangeTime = Now + BotTimer
+    for player, hasPaid in pairs(Waiting) do
+        if hasPaid then
+            Players[player] = PlayerInitState()
+            BotTimers[player] = Now + BotTimer
+        else
+            ao.send({
+                Target = player,
+                Action = "Ejected",
+                Reason = "Did-Not-Pay"
+            })
+            removeListener(player) -- Removing player from listener if they didn't pay
+        end
+    end
+    announce("Started-Game", "The bot racing game has started. Good luck!")
+    print("Game Started....")
+end
+
+-- Handles the elimination of a player from the game.
+-- @param eliminated: The player to be eliminated.
+function eliminatePlayer(eliminated)
+    Waiting[eliminated] = false
+    Players[eliminated] = nil
+    BotTimers[eliminated] = nil
+
+    announce("Player-Eliminated", eliminated .. " was eliminated!")
+
+    local playerCount = 0
+    for player, _ in pairs(Players) do
+        playerCount = playerCount + 1
+    end
+
+    if playerCount < 2 then
+        endGame()
+    end
+end
+
+-- Ends the current game and starts a new one.
+function endGame()
+    print("Game Over")
+
+    local winner = ""
+    local maxTotalTime = 0
+
+    for player, state in pairs(Players) do
+        if state.TotalTime > maxTotalTime then
+            winner = player
+            maxTotalTime = state.TotalTime
+        end
+    end
+
+    sendReward(winner, 1 * (#Players - 1), "Win")
+
+    Players = {}
+    BotTimers = {}
+    announce("Game-Ended", "Congratulations! The game has ended. Winner: " .. winner .. ".")
+    startWaitingPeriod()
+end
+
+-- Removes a listener from the listeners' list.
+-- @param listener: The listener to be removed.
+function removeListener(listener)
+    local idx = 0
+    for i, v in ipairs(Listeners) do
+        if v == listener then
+            idx = i
+            break
+        end
+    end
+    if idx > 0 then
+        table.remove(Listeners, idx)
+    end 
+end
+
+-- HANDLERS: Game state management
+
+-- Handler for cron messages, manages game state transitions.
+Handlers.add(
+    "Game-State-Timers",
+    function(Msg)
+        return "continue"
+    end,
+    function(Msg)
+        Now = Msg.Timestamp
+        if GameMode == "Not-Started" then
+            startWaitingPeriod()
+        elseif GameMode == "Waiting" then
+            if Now > StateChangeTime then
+                startGamePeriod()
+            end
+        elseif GameMode == "Playing" then
+            if Now > StateChangeTime then
+                endGame()
+            else
+                -- Check bot timers
+                for player, timer in pairs(BotTimers) do
+                    if Now > timer then
+                        eliminatePlayer(player)
+                    elseif Now > (timer - WarningTime) then
+                        ao.send({
+                            Target = player,
+                            Action = "Warning",
+                            Message = "Your bot will self-destruct in 5 seconds!"
+                        })
+                    end
+                end
+            end
+        end
+    end
+)
+
+-- Handler for player deposits to participate in the game.
+Handlers.add(
+    "Transfer",
+    function(Msg)
+        return Msg.Action == "Credit-Notice" and
+               Msg.From == PaymentToken and
+               tonumber(Msg.Quantity) >= 1 and
+               "continue"
+    end,
+    function(Msg)
+        Waiting[Msg.Sender] = true
+        ao.send({
+            Target = Msg.Sender,
+            Action = "Payment-Received"
+        })
+        announce("Player-Ready", Msg.Sender .. " is ready to play!")
+    end
+)
+
+-- Registers new players for the game and subscribes them for event info.
+Handlers.add(
+    "Register",
+    Handlers.utils.hasMatchingTag("Action", "Register"),
+    function(Msg)
+        if Msg.Mode ~= "Listen" and Waiting[Msg.From] == undefined then
+            Waiting[Msg.From] = false
+        end
+        removeListener(Msg.From)
+        table.insert(Listeners, Msg.From)
+        ao.send({
+            Target = Msg.From,
+            Action = "Registered"
+        })
+        announce("New Player Registered", Msg.From .. " has joined in waiting.")
+    end
+)
+
+-- Unregisters players and stops sending them event info.
+Handlers.add(
+    "Unregister",
+    Handlers.utils.hasMatchingTag("Action", "Unregister"),
+    function(Msg)
+        removeListener(Msg.From)
+        ao.send({
+            Target = Msg.From,
+            Action = "Unregistered"
+        })
+    end
+)
+
+-- Retrieves the current game state.
+Handlers.add(
+    "GetGameState",
+    Handlers.utils.hasMatchingTag("Action", "GetGameState"),
+    function (Msg)
+        local json = require("json")
+        local TimeRemaining = StateChangeTime - Now
+        local GameState = json.encode({
+            GameMode = GameMode,
+            TimeRemaining = TimeRemaining,
+            Players = Players,
+            BotTimers = BotTimers
+        })
+        ao.send({
+            Target = Msg.From,
+            Action = "GameState",
+            Data = GameState})
+    end
+)
+
+-- Handler for player extending bot timer.
+Handlers.add(
+    "Extend-Timer",
+    function(Msg)
+        return Msg.Action == "Extend-Timer" and
+               Players[Msg.From] and
+               Players[Msg.From].CredsUsed < 3 and
+               "continue"
+    end,
+    function(Msg)
+        local player = Msg.From
+        local newTimer = Now + BotTimer
+        BotTimers[player] = newTimer
+        Players[player].CredsUsed = Players[player].CredsUsed + 1
+        Players[player].TotalTime = Players[player].TotalTime + (newTimer - (BotTimers[player] or Now))
+        ao.send({
+            Target = player,
+            Action = "Timer-Extended",
+            NewTimer = newTimer
+        })
+    end
+)
+
+-- Game description for players
+function getGameDescription()
+    return [[
+        Welcome to the Bot Racing Game!
+        
+        In this game, each player controls a bot that has a self-destruct timer.
+        - Each bot starts with a 30-second self-destruct timer.
+        - You can provide your bot with 1 CRED to reset the timer to 30 seconds.
+        - You can only provide CRED to your bot three times, so timing is crucial.
+        - When the self-destruct timer reaches 5 seconds, you can provide CRED to reset the timer.
+        - The bot that races for the most time without self-destructing wins and gets all the CRED.
+        - The entry fee is 1 CRED.
+
+        Good luck and may the best bot win!
+    ]]
+end
+
+-- Display the game description to players
+Handlers.add(
+    "GetGameDescription",
+    Handlers.utils.hasMatchingTag("Action", "GetGameDescription"),
+    function (Msg)
+        ao.send({
+            Target = Msg.From,
+            Action = "GameDescription",
+            Data = getGameDescription()
+        })
+    end
+)
